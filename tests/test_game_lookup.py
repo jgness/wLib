@@ -231,18 +231,19 @@ def test_f95_thread_ratings_reads_built_at_and_chunks(catalog, tmp_path):
     )
     catalog.commit()
 
-    built_at, ratings = f95_thread_ratings([*range(1, 1201), 5000, 9999])
+    built_at, ratings, counts = f95_thread_ratings([*range(1, 1201), 5000, 9999])
+    assert counts == {}
     assert built_at == "2026-11-01T12:00:00Z"
     assert len(ratings) == 1200
     assert ratings[3] == pytest.approx(4.3)
     assert 5000 not in ratings and 9999 not in ratings
 
     database.update_setting("catalog_enabled", "0")
-    assert f95_thread_ratings([3]) == ("", {})
+    assert f95_thread_ratings([3]) == ("", {}, {})
     database.update_setting("catalog_enabled", "1")
     catalog.close()
     (tmp_path / "catalog.db").unlink()
-    assert f95_thread_ratings([3]) == ("", {})
+    assert f95_thread_ratings([3]) == ("", {}, {})
     assert not (tmp_path / "catalog.db").exists()
 
 

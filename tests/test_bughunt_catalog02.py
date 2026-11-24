@@ -164,7 +164,8 @@ def test_bulk_reads_skip_ids_outside_the_sqlite_range(lookup_catalog):
     )
     conn.commit()
     thread_ids = [1, 1, MAX_ID, MAX_ID + 1, 2**64]
-    _, ratings = f95_thread_ratings(thread_ids)
+    _, ratings, counts = f95_thread_ratings(thread_ids)
+    assert counts == {}
     assert ratings == {1: 4.5, MAX_ID: 4.5}
     details = f95_thread_details(thread_ids)
     assert set(details) == {1, MAX_ID}

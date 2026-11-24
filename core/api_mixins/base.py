@@ -70,7 +70,7 @@ _torrent_exit_hook = False
 
 
 # Device-local: the catalog snapshot SHA-256 whose ratings were last filled.
-CATALOG_RATING_FILL_SETTING = "catalog_rating_fill_sha"
+CATALOG_RATING_FILL_SETTING = "catalog_rating_count_fill_sha"
 CATALOG_DETAILS_FILL_SETTING = "catalog_details_fill_sha"
 
 
@@ -1527,12 +1527,9 @@ class ApiBase:
     def _fill_ratings_from_catalog(self) -> int:
         """Fill F95 ratings from the installed catalog, once per snapshot.
 
-        Runs on the catalog thread after a snapshot installs and once at
-        startup. A catalog rating fills an empty rating, and replaces a stored
-        one only when the catalog was built after that rating was read (or
-        the read time is unknown) and the value at one decimal differs. Zero,
-        missing and out-of-range catalog ratings are skipped. Tags are never
-        touched. Returns the number of games changed.
+        Feed scores use snapshot build time for freshness. Count-bearing
+        ratings record the count observation time in rating_updated_at, so
+        later snapshots can refresh counts independently of score changes.
         """
         import re
         import sqlite3
@@ -1573,14 +1570,14 @@ class ApiBase:
                         (
                             game_id,
                             int(thread_id),
-                            str(cast(object, row["rating"]) or "").strip(),
-                            str(cast(object, row["rating_updated_at"]) or "").strip(),
+                            str(cast(object, row["rating"]) or ""),
+                            str(cast(object, row["rating_updated_at"]) or ""),
                         )
                     )
             if not games:
                 update_setting(CATALOG_RATING_FILL_SETTING, snapshot_sha)
                 return 0
-            built_at, ratings = f95_thread_ratings([game[1] for game in games])
+            built_at, ratings, counts = f95_thread_ratings([game[1] for game in games])
             built_time = parse_time(built_at)
             if built_time is None:
                 return 0  # an unreadable catalog; try again with the next run
@@ -1588,20 +1585,50 @@ class ApiBase:
                 catalog_rating = ratings.get(thread_id)
                 if catalog_rating is None or not 0 < catalog_rating <= 5:
                     continue
-                if stored:
-                    read_time = parse_time(read_at)
-                    if read_time is not None and read_time >= built_time:
-                        continue
-                    match = re.search(r"\d+(?:\.\d+)?", stored)
-                    if match and round(float(match.group()), 1) == round(
-                        catalog_rating, 1
-                    ):
-                        continue
-                _ = conn.execute(
-                    "UPDATE games SET rating = ?, rating_updated_at = ? WHERE id = ?",
-                    (f"{round(catalog_rating, 1):.1f}/5", built_at, game_id),
+                read_time = parse_time(read_at)
+                match = re.search(r"\d+(?:\.\d+)?", stored)
+                same_score = match is not None and round(
+                    float(match.group()), 1
+                ) == round(catalog_rating, 1)
+                if (
+                    stored.strip()
+                    and read_time is not None
+                    and (
+                        read_time > built_time
+                        or (read_time == built_time and not same_score)
+                    )
+                ):
+                    continue
+
+                # A bare rating may be stamped with snapshot build time. Only
+                # compare a candidate count against the timestamp of a saved count.
+                score, _, saved_count = stored.strip().partition(" (")
+                count, fetched_at = counts.get(thread_id, (0, ""))
+                count_time = parse_time(fetched_at)
+                if (
+                    count > 0
+                    and count_time is not None
+                    and count_time <= built_time
+                    and (not saved_count or read_time is None or count_time > read_time)
+                ):
+                    suffix = f" ({count:,} {'review' if count == 1 else 'reviews'})"
+                    updated_at = fetched_at
+                elif same_score:
+                    continue
+                else:
+                    # Keep an existing count and its observation time when only
+                    # the feed score can be refreshed.
+                    suffix = f" ({saved_count}" if saved_count else ""
+                    updated_at = read_at if saved_count else built_at
+
+                score = score if same_score else f"{catalog_rating:.1f}/5"
+                rating = score + suffix
+                cursor = conn.execute(
+                    "UPDATE games SET rating = ?, rating_updated_at = ? WHERE id = ? "
+                    "AND COALESCE(rating, '') = ? AND COALESCE(rating_updated_at, '') = ?",
+                    (rating, updated_at, game_id, stored, read_at),
                 )
-                changed += 1
+                changed += cursor.rowcount
             if changed:
                 conn.commit()
         update_setting(CATALOG_RATING_FILL_SETTING, snapshot_sha)

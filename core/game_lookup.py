@@ -641,48 +641,17 @@ def lc_threads_screenshots(thread_ids: Sequence[str]) -> dict[str, list[str]]:
     return _thread_screenshots("lc_threads", thread_ids)
 
 
-def f95_thread_rating_counts(thread_ids: Sequence[str]) -> dict[str, int]:
-    """Known review counts from the installed catalog, including explicit zero."""
-    ids = _sqlite_ids(thread_ids)
-    if not ids or database.get_setting("catalog_enabled") == "0":
-        return {}
-    path = Path(database.DB_PATH).parent / CATALOG_FILE
-    counts: dict[str, int] = {}
-    try:
-        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as conn:
-            for offset in range(0, len(ids), 500):
-                chunk = ids[offset : offset + 500]
-                placeholders = ",".join("?" for _ in chunk)
-                rows = cast(
-                    list[tuple[object, object]],
-                    conn.execute(
-                        "SELECT thread_id, rating_count FROM f95_thread_details "
-                        + f"WHERE status = 'ok' AND thread_id IN ({placeholders})",
-                        chunk,
-                    ).fetchall(),
-                )
-                for thread_id, count in rows:
-                    if isinstance(count, int) and count >= 0:
-                        counts[str(thread_id)] = count
-    except (sqlite3.Error, OSError, ValueError):
-        # Older snapshots may have no review-count column.
-        return {}
-    return counts
-
-
-def f95_thread_ratings(thread_ids: Sequence[int]) -> tuple[str, dict[int, float]]:
-    """The catalog's ``built_at`` and its F95 rating for each known thread.
-
-    Reads the catalog read-only, in chunks of 500 IDs. Returns ``("", {})``
-    when the catalog is off, missing or unreadable. Rows with no rating are
-    left out; the caller decides which values to use.
-    """
+def f95_thread_ratings(
+    thread_ids: Sequence[int],
+) -> tuple[str, dict[int, float], dict[int, tuple[int, str]]]:
+    """Snapshot build time, feed ratings, and observed (count, fetched_at) pairs."""
     ids = _bindable_ids(thread_ids)
     path = Path(database.DB_PATH).parent / CATALOG_FILE
     ratings: dict[int, float] = {}
+    counts: dict[int, tuple[int, str]] = {}
     try:
         if database.get_setting("catalog_enabled") == "0" or not path.is_file():
-            return "", {}
+            return "", {}, {}
         with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as conn:
             row = cast(
                 tuple[object] | None,
@@ -691,22 +660,48 @@ def f95_thread_ratings(thread_ids: Sequence[int]) -> tuple[str, dict[int, float]
                 ).fetchone(),
             )
             built_at = str(row[0] or "").strip() if row else ""
+            columns = cast(
+                list[tuple[object, ...]],
+                conn.execute("PRAGMA table_info(f95_thread_details)").fetchall(),
+            )
+            has_counts = {"rating_count", "fetched_at", "kept_after_failure"} <= {
+                column[1] for column in columns
+            }
+            # A failed read keeps the old count but advances fetched_at.
+            select = "SELECT t.thread_id, t.rating"
+            tables = " FROM f95_threads t"
+            if has_counts:
+                select += ", d.rating_count, d.fetched_at"
+                tables += (
+                    " LEFT JOIN f95_thread_details d ON d.thread_id = t.thread_id "
+                    "AND d.status = 'ok' AND d.kept_after_failure = 0"
+                )
+            else:
+                select += ", NULL, NULL"
             for offset in range(0, len(ids), 500):
                 chunk = ids[offset : offset + 500]
                 placeholders = ",".join("?" for _ in chunk)
                 rows = cast(
-                    list[tuple[object, object]],
+                    list[tuple[object, object, object, object]],
                     conn.execute(
-                        f"SELECT thread_id, rating FROM f95_threads WHERE thread_id IN ({placeholders}) AND rating IS NOT NULL",
+                        select
+                        + tables
+                        + f" WHERE t.thread_id IN ({placeholders}) AND t.rating IS NOT NULL",
                         chunk,
                     ).fetchall(),
                 )
-                for thread_id, rating in rows:
+                for thread_id, rating, count, fetched_at in rows:
                     if isinstance(thread_id, int) and isinstance(rating, int | float):
                         ratings[thread_id] = float(rating)
+                        if (
+                            isinstance(count, int)
+                            and count >= 0
+                            and isinstance(fetched_at, str)
+                        ):
+                            counts[thread_id] = (count, fetched_at)
     except (sqlite3.Error, OSError, ValueError):
-        return "", {}
-    return built_at, ratings
+        return "", {}, {}
+    return built_at, ratings, counts
 
 
 # Order of the developer links a game keeps.
